@@ -1,0 +1,243 @@
+name: probe-toolchain
+
+# =============================================================================
+# Phase 0 切り分け用の使い捨てワークフロー。
+#
+# 目的:
+#   1. どの runner ラベルが存在するか
+#   2. 各 runner に入っている Xcode / iOS SDK は何か
+#   3. Reynard の XUL が要求する platform / minos / sdk は何か
+#   4. ★ 手元のツールチェーンで XUL に実際にリンクできるか
+#   5. MainProcessInit / ChildProcessInit が本当に export されているか
+#
+# 結果は Job Summary に出るので、成果物をダウンロードしなくても読めます。
+#
+# 存在しない runner ラベルはジョブごと失敗しますが、
+# fail-fast: false + continue-on-error: true なので他は進みます。
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      reynard_tag:
+        description: "Reynard のリリースタグ"
+        type: string
+        default: "0.10.1"
+      reynard_asset:
+        description: "アセット名"
+        type: string
+        default: "Reynard.ipa"
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-14
+          - macos-15
+          - macos-26
+          - macos-latest
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 30
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. runner の素性
+      # -----------------------------------------------------------------------
+      - name: Runner identity
+        run: |
+          {
+            echo "## \`${{ matrix.runner }}\`"
+            echo
+            echo '### Runner'
+            echo '```'
+            echo "label        : ${{ matrix.runner }}"
+            echo "image        : ${ImageOS:-?} / ${ImageVersion:-?}"
+            echo "macOS        : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            echo "arch         : $(uname -m)"
+            echo "cpu cores    : $(sysctl -n hw.ncpu)"
+            echo "memory       : $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GB"
+            echo "free disk    : $(df -h / | awk 'NR==2{print $4}')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 2. インストール済み Xcode を全部列挙
+      # -----------------------------------------------------------------------
+      - name: Enumerate Xcode installations
+        run: |
+          {
+            echo '### Installed Xcode'
+            echo '```'
+            for app in /Applications/Xcode*.app; do
+              [ -d "$app" ] || continue
+              ver=$("$app/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | tr '\n' ' ')
+              printf '%-34s %s\n' "$(basename "$app")" "$ver"
+            done
+            echo
+            echo "selected: $(xcode-select -p)"
+            xcodebuild -version
+            echo
+            echo "swift: $(swift --version 2>&1 | head -1)"
+            echo '```'
+            echo
+            echo '### Available iOS SDKs'
+            echo '```'
+            xcodebuild -showsdks 2>/dev/null | grep -i 'ios' || echo '(none)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 3. Reynard IPA から XUL だけ取り出す
+      # -----------------------------------------------------------------------
+      - name: Fetch XUL from Reynard release
+        id: fetch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/minh-ton/reynard-browser/releases/download/${{ inputs.reynard_tag }}/${{ inputs.reynard_asset }}"
+          echo "downloading $URL"
+          curl -fSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" -o Reynard.ipa "$URL" \
+            || curl -fSL --retry 3 -o Reynard.ipa "$URL"
+          ls -lh Reynard.ipa
+
+          unzip -q -o Reynard.ipa 'Payload/*/Frameworks/*'
+          APP=""
+          for d in Payload/*.app; do [ -d "$d" ] && { APP="$d"; break; }; done
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "XUL=$APP/Frameworks/XUL" >> "$GITHUB_ENV"
+          ls -lh "$APP/Frameworks/" | head -20
+
+      # -----------------------------------------------------------------------
+      # 4. XUL の Mach-O メタデータ  ← ここが本題
+      # -----------------------------------------------------------------------
+      - name: Inspect XUL Mach-O
+        run: |
+          set -uo pipefail
+          {
+            echo '### XUL Mach-O metadata'
+            echo '```'
+            echo "size: $(du -h "$XUL" | cut -f1)"
+            echo
+            echo "--- LC_BUILD_VERSION / LC_VERSION_MIN ---"
+            otool -l "$XUL" | grep -A6 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_IPHONEOS' | head -30
+            echo
+            echo "--- install_name / dependencies ---"
+            otool -L "$XUL" | head -20
+            echo
+            echo "--- vtool -show ---"
+            vtool -show "$XUL" 2>&1 | head -20 || echo "(vtool unavailable)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify exported symbols
+        run: |
+          set -uo pipefail
+          {
+            echo '### Exported symbols'
+            echo '```'
+            for sym in MainProcessInit ChildProcessInit; do
+              hit=$(nm -gU "$XUL" 2>/dev/null | grep -E "_${sym}\$" | head -1 || true)
+              if [ -n "$hit" ]; then
+                echo "OK    $sym  ->  $hit"
+              else
+                echo "MISS  $sym  (not exported!)"
+              fi
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 5. ★ 実リンク試験。インストール済み Xcode を総当たりする。
+      #    deployment target も 15.0 / 18.0 / 26.0 で振る。
+      # -----------------------------------------------------------------------
+      - name: Link test against XUL
+        run: |
+          set -uo pipefail
+
+          cat > probe.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          // XUL からエクスポートされる想定のシンボル
+          extern int MainProcessInit(int argc, char** argv, id runtime);
+          int main(int argc, char** argv) {
+            // 実行はしない。リンクが通るかだけを見る。
+            if (argc == 0x7FFFFFFF) { return MainProcessInit(argc, argv, nil); }
+            return 0;
+          }
+          EOF
+
+          {
+            echo '### Link test (clang -> XUL)'
+            echo
+            echo '| Xcode | SDK | -mios-version-min | result |'
+            echo '|---|---|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            CLANG="$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+            [ -x "$CLANG" ] || continue
+            XCVER=$("$app/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1 | awk '{print $2}')
+            SDK=$(ls -d "$app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/"iPhoneOS*.sdk 2>/dev/null | tail -1)
+            [ -n "$SDK" ] || continue
+            SDKNAME=$(basename "$SDK" .sdk)
+
+            for MINOS in 15.0 18.0 26.0; do
+              LOG="link_${XCVER}_${MINOS}.log"
+              if "$CLANG" -arch arm64 -isysroot "$SDK" \
+                   -mios-version-min="$MINOS" \
+                   -framework Foundation \
+                   probe.m "$XUL" -o "probe_${XCVER}_${MINOS}" > "$LOG" 2>&1; then
+                if [ -s "$LOG" ]; then
+                  RESULT="✅ OK (warnings: $(wc -l < "$LOG" | tr -d ' '))"
+                else
+                  RESULT="✅ OK (clean)"
+                fi
+              else
+                FIRST=$(grep -m1 -E 'error|ld:' "$LOG" | cut -c1-160 | sed 's/|/\\|/g')
+                RESULT="❌ FAIL — \`${FIRST}\`"
+              fi
+              echo "| $XCVER | $SDKNAME | $MINOS | $RESULT |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo '<details><summary>link logs (raw)</summary>' >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          for f in link_*.log; do
+            [ -f "$f" ] || continue
+            echo "**$f**" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            head -25 "$f" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo '</details>' >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 6. XcodeGen の入手可否（rev.2 で必要）
+      # -----------------------------------------------------------------------
+      - name: XcodeGen availability
+        run: |
+          set -uo pipefail
+          {
+            echo '### XcodeGen'
+            echo '```'
+            if brew install xcodegen > /dev/null 2>&1; then
+              echo "installed: $(xcodegen --version 2>&1)"
+            else
+              echo "brew install xcodegen FAILED"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.runner }}
+          path: |
+            link_*.log
+          if-no-files-found: ignore

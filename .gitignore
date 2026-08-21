@@ -1,0 +1,51 @@
+# --- Gecko エンジン（約 280MB。絶対にコミットしない） -----------------------
+engine/dist/
+
+# --- Reynard から取り込む Swift ラッパ層 ---------------------------------------
+# scripts/import-reynard.sh がビルド時に取得する。リポジトリには含めない。
+# 独自ファイル (Kotone-Bridging-Header.h) と .gitkeep は残す。
+# ⚠️ 本リポジトリ独自のファイルは必ず「!」で除外すること。
+#    一覧は scripts/import-reynard.sh の PROTECTED と一致させる。
+Sources/GeckoView/*
+!Sources/GeckoView/.gitkeep
+# KotoneBridge.swift は GeckoView ターゲットの内側に置く必要がある。
+# addListener と GeckoEventListenerInternal が public ではないため。
+!Sources/GeckoView/KotoneBridge.swift
+# 構造化クローンを迂回する代替経路（ローカル HTTP）
+!Sources/GeckoView/KotoneHTTPBridge.swift
+Sources/Helper/*
+!Sources/Helper/.gitkeep
+Sources/Shared/*
+!Sources/Shared/.gitkeep
+Sources/ThirdParty/*
+!Sources/ThirdParty/.gitkeep
+Sources/JIT/*
+!Sources/JIT/.gitkeep
+Sources/Bridging/*
+!Sources/Bridging/.gitkeep
+!Sources/Bridging/Kotone-Bridging-Header.h
+Sources/IMPORT_PROVENANCE.txt
+
+# Sources/Vivi/ は ViviMusic からの vendoring。
+# Reynard と違い外部取得ではないので、リポジトリに含める（無視しない）。
+
+# --- Xcode -------------------------------------------------------------------
+*.xcodeproj/
+*.xcworkspace/
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# --- ビルド生成物 -------------------------------------------------------------
+Payload/
+*.ipa
+*.tipa
+*.dSYM.zip
+*.dSYM
+
+# --- スクリプトのバックアップ ---------------------------------------------------
+*.bak
+
+# --- macOS -------------------------------------------------------------------
+.DS_Store

@@ -1,0 +1,32 @@
+# =============================================================================
+# Gecko エンジンのバージョン固定
+#
+# scripts/fetch-engine.sh がこのファイルを読み、指定リリースの IPA を取得して
+# BuildID / Milestone が一致することを検証する。
+#
+# GPL-3.0 の Corresponding Source 要件のため、ここに書いたタグから
+# 対応するソースが辿れる状態を維持すること。
+# エンジンを更新するときは、この4行を同時に更新する。
+# =============================================================================
+
+# 取得元
+REYNARD_REPO=minh-ton/reynard-browser
+REYNARD_TAG=0.10.1
+REYNARD_ASSET=Reynard.ipa
+
+# 検証値（Payload/Reynard.app/Frameworks/GeckoView.framework/Frameworks/platform.ini）
+GECKO_MILESTONE=153.0.4
+GECKO_BUILDID=20260817170122
+
+# ヘッダ再構成用（scripts/fetch-headers.sh）
+# 配布 IPA に .h は含まれないため、この 2 ファイルだけ upstream から取得して
+# reynard-browser の patches を適用する。clone は不要。
+FIREFOX_REPO=mozilla-firefox/firefox
+FIREFOX_TAG=FIREFOX_153_0_4_RELEASE
+
+# 参考情報（検証には使わない）
+#   Reynard CFBundleShortVersionString : 0.10.1
+#   Reynard CFBundleVersion (git hash) : a7e06a6
+#   Built with                         : Xcode 17F113 / iOS SDK 26.5
+#   Reynard MinimumOSVersion           : 13.0
+#   展開後サイズ (engine/dist)          : 約 280 MB

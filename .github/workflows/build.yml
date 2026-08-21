@@ -1,0 +1,438 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      gecko_integration:
+        description: "Gecko 統合。auto は project.yml に従う (既定で有効)。off は Sources/App が壊れるので検証用のみ"
+        type: choice
+        options: [auto, "on", "off"]
+        default: auto
+      keep_dictionaries:
+        description: "Gecko の辞書・ハイフネーションを同梱する"
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # タイムスタンプを一度だけ計算して全ステップで共有する（ドリフト防止）
+      # -----------------------------------------------------------------------
+      - name: Compute JST timestamp
+        run: |
+          echo "STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S%z' | sed 's/\(+[0-9]\{2\}\)\([0-9]\{2\}\)$/\1-\2/')" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Gecko 統合の有無を決める。
+      #
+      #   auto … project.yml の GECKO-TOGGLE:deps マーカーから自動判定（既定）
+      #          Phase 0 完了後、project.yml は有効状態でコミットしてある
+      #   on   … 強制的に有効化。次の "Apply Gecko toggle" ステップが
+      #          この実行の中だけ project.yml を書き換える
+      #   off  … 強制的に無効化。
+      #          Phase 1 以降 Sources/App は GeckoView を import するため、
+      #          off にすると必ずビルドが失敗する。配管検証用にのみ残してある
+      #
+      # on/off があるのは、手元にターミナルが無くても
+      # GitHub の画面だけで 0-B1 / 0-B2 を切り替えられるようにするため。
+      # 書き換えはランナー上のみで、リポジトリには反映されない。
+      # -----------------------------------------------------------------------
+      - name: Detect Gecko integration
+        run: |
+          set -uo pipefail
+          if awk '
+            /^[[:space:]]*# >>> GECKO-TOGGLE:deps >>>/ { inb = 1; next }
+            /^[[:space:]]*# <<< GECKO-TOGGLE:deps <<</ { inb = 0; next }
+            inb && /^[[:space:]]*#@ / { found = 1 }
+            END { exit(found ? 0 : 1) }
+          ' project.yml; then
+            DETECTED=false
+          else
+            DETECTED=true
+          fi
+
+          case "${{ inputs.gecko_integration || 'auto' }}" in
+            on)  GECKO=true  ; SRC="入力による上書き" ;;
+            off) GECKO=false ; SRC="入力による上書き" ;;
+            *)   GECKO=$DETECTED ; SRC="project.yml から自動判定" ;;
+          esac
+
+          echo "GECKO=$GECKO" >> "$GITHUB_ENV"
+          echo "Gecko 統合: $GECKO  ($SRC)"
+
+          if [ "$GECKO" != "$DETECTED" ]; then
+            echo "::notice::入力 (${{ inputs.gecko_integration }}) が project.yml ($DETECTED) と異なるため、この実行内で project.yml を書き換えます。"
+          fi
+
+          {
+            echo "### Gecko integration"
+            echo '```'
+            echo "project.yml   : $DETECTED"
+            echo "使用する設定  : $GECKO ($SRC)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # project.yml を env.GECKO に合わせる。
+      # ランナー上のファイルを書き換えるだけで、コミットはしない。
+      # 恒久的に切り替えたい場合は手元で ./scripts/enable-gecko.sh を実行し、
+      # 変更後の project.yml を push すること。
+      # -----------------------------------------------------------------------
+      - name: Apply Gecko toggle
+        run: |
+          set -uo pipefail
+          chmod +x scripts/enable-gecko.sh
+          if [ "$GECKO" = "true" ]; then
+            ./scripts/enable-gecko.sh --force
+          else
+            ./scripts/enable-gecko.sh --disable
+          fi
+          rm -f project.yml.bak
+          exit 0
+
+      - name: Read engine version
+        run: |
+          {
+            echo "REYNARD_TAG=$(grep '^REYNARD_TAG=' engine/VERSION.txt | cut -d= -f2-)"
+            echo "GECKO_MILESTONE=$(grep '^GECKO_MILESTONE=' engine/VERSION.txt | cut -d= -f2-)"
+            echo "GECKO_BUILDID=$(grep '^GECKO_BUILDID=' engine/VERSION.txt | cut -d= -f2-)"
+          } >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Gecko エンジンのキャッシュ。280MB あるので毎回落とすと遅い。
+      # VERSION.txt が変わったときだけ再取得される。
+      # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # Phase 0-B1 (配管検証) では Gecko を組み込まないため、
+      # engine 関連は gecko_integration=true のときだけ走る。
+      # Reynard のソースを Sources/ に配置したら true にする。
+      # -----------------------------------------------------------------------
+      - name: Cache Gecko engine
+        if: env.GECKO == 'true'
+        id: gecko-cache
+        uses: actions/cache@v4
+        with:
+          path: engine/dist
+          key: gecko-${{ env.GECKO_BUILDID }}-${{ hashFiles('engine/VERSION.txt') }}-dict${{ inputs.keep_dictionaries && '1' || '0' }}
+
+      - name: Fetch Gecko engine
+        if: env.GECKO == 'true' && steps.gecko-cache.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_DICTIONARIES: ${{ inputs.keep_dictionaries && '1' || '0' }}
+        run: |
+          chmod +x scripts/fetch-engine.sh
+          ./scripts/fetch-engine.sh
+
+      # Gecko の EXPORTS.GeckoView ヘッダを再構成する。
+      # 配布 IPA に .h が含まれないため、この 3 ファイルだけソースから作る。
+      # firefox の clone は不要（raw URL で 2 ファイル + patch 3 つ）。
+      # Reynard の Swift ラッパ層を取得する。
+      # 配布 IPA の GeckoView.framework は .swiftmodule を含まないため
+      # Swift から import できず、ソースからビルドする必要がある。
+      #
+      # --keep-src で展開したツリーを残し、fetch-headers.sh に渡すことで
+      # 同じ tarball を 2 回ダウンロードしないようにしている。
+      - name: Import Reynard sources
+        if: env.GECKO == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/import-reynard.sh
+          ./scripts/import-reynard.sh --keep-src "$RUNNER_TEMP/reynard-src"
+
+      # -----------------------------------------------------------------------
+      # 独自ファイルが取り込みで消えていないかを確認する。
+      #
+      # rev.20 は KotoneBridge.swift が .gitignore に引っかかって push されず、
+      #   error: cannot find 'KotoneBridge' in scope
+      # で落ちた。ファイルの「不在」は原因が分かりにくいので、
+      # import 直後に明示的に確認する。
+      # 対象は scripts/import-reynard.sh の PROTECTED と同じ集合。
+      # -----------------------------------------------------------------------
+      - name: Verify own sources survived import
+        if: env.GECKO == 'true'
+        run: |
+          set -uo pipefail
+          PROT="$(grep '^PROTECTED=' scripts/import-reynard.sh | sed 's/PROTECTED=//; s/"//g')"
+          echo "protected files: $PROT"
+          rc=0
+          for f in $PROT; do
+            found="$(find Sources -name "$f" -type f | head -1)"
+            if [ -n "$found" ]; then
+              printf '  OK   %s -> %s\n' "$f" "$found"
+            else
+              printf '  MISS %s\n' "$f"
+              echo "::error::$f が Sources/ にありません。.gitignore の除外 (!) を確認してください。"
+              rc=1
+            fi
+          done
+          exit $rc
+
+      - name: Fetch Gecko headers
+        if: env.GECKO == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x scripts/fetch-headers.sh
+          ./scripts/fetch-headers.sh "$RUNNER_TEMP/reynard-src"
+
+      - name: Verify engine layout
+        if: env.GECKO == 'true'
+        run: |
+          test -f engine/dist/bin/XUL              || { echo "::error::XUL missing"; exit 1; }
+          test -f engine/dist/bin/greprefs.js      || { echo "::error::greprefs.js missing"; exit 1; }
+          test -f engine/dist/bin/chrome.manifest  || { echo "::error::chrome.manifest missing"; exit 1; }
+          test -d engine/dist/bin/modules          || { echo "::error::modules/ missing"; exit 1; }
+          test -d engine/dist/bin/components       || { echo "::error::components/ missing"; exit 1; }
+          test -d engine/dist/bin/actors           || { echo "::error::actors/ missing"; exit 1; }
+          test -d engine/dist/bin/default-theme    || { echo "::error::default-theme/ missing"; exit 1; }
+          for h in IOSBootstrap.h GeckoViewSwiftSupport.h GeckoViewRuntimeSupport.h; do
+            test -s "engine/dist/include/GeckoView/$h" \
+              || { echo "::error::header missing: $h"; exit 1; }
+          done
+          for d in GeckoView Helper Bridging Shared; do
+            n=$(find "Sources/$d" -type f ! -name '.gitkeep' | wc -l | tr -d ' ')
+            [ "$n" -gt 0 ] || { echo "::error::Sources/$d が空です"; exit 1; }
+            echo "Sources/$d: $n files"
+          done
+          cat engine/dist/PROVENANCE.txt
+          cat engine/dist/include/PROVENANCE.txt
+          cat Sources/IMPORT_PROVENANCE.txt
+
+      # -----------------------------------------------------------------------
+      # Xcode の選択
+      #
+      # probe-toolchain の結果: Xcode 15.0.1 〜 26.4.1 のすべてで
+      # XUL へのリンクは警告ゼロで通る（72 通り全 CLEAN）。
+      # つまりリンク互換性の制約は無い。
+      #
+      # それでも 26.x を選ぶ理由は Swift ソース側にある。
+      # Reynard 本家は Xcode 26.6 / iOS SDK 26.5 でビルドされており、
+      # SDK 26 世代の API を参照している可能性がある。
+      # 古い SDK ではコンパイルできないため、ビルド環境を上流に合わせる。
+      #
+      # 名前を決め打ちせず、利用可能な最新の Xcode 26.x を選ぶ。
+      # イメージ更新でバージョンが変わっても壊れない。
+      # -----------------------------------------------------------------------
+      # -----------------------------------------------------------------------
+      # Xcode の選択
+      #
+      # probe-toolchain の結果: Xcode 15.0.1 〜 26.4.1 の全 72 通りで
+      # XUL へのリンクは警告ゼロで成功する。つまりリンク互換性の制約は無い。
+      # それでも 26.x を選ぶのは Swift ソース側の理由（Reynard 上流は
+      # Xcode 26.6 / iOS SDK 26.5 でビルドされている）。
+      #
+      # したがって「選べたら選ぶ」であって必須要件ではない。
+      # このステップは何があってもビルドを止めてはいけない。
+      #
+      # 注意点 3 つ:
+      #   * xcodebuild を起動しない。
+      #     ランナー上の一部の Xcode で xcodebuild -version が SIGABRT(134) する。
+      #     set -e 下で ver="$(...)" すると代入文がその終了コードを継承して
+      #     ステップごと死ぬ。version.plist を読むだけならプロセスを起動しない。
+      #   * sort -V を使わない。macOS の BSD sort は対応が不確実。
+      #     awk でゼロ埋め数値に変換して比較する。
+      #   * sudo xcode-select ではなく DEVELOPER_DIR を GITHUB_ENV に書く。
+      # -----------------------------------------------------------------------
+      - name: Select Xcode
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+
+          vnum() {
+            printf '%s' "$1" | awk -F. '{
+              printf "%03d%03d%03d", ($1==""?0:$1), ($2==""?0:$2), ($3==""?0:$3)
+            }'
+          }
+
+          BEST=""
+          BEST_VER=""
+          BEST_NUM=0
+
+          echo "--- available Xcode ---"
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            plist="$app/Contents/version.plist"
+            ver=""
+            if [ -f "$plist" ]; then
+              ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null)" || ver=""
+            fi
+            if [ -z "$ver" ]; then
+              printf '  %-28s %s\n' "$(basename "$app")" "(version.plist 読み取り不可)"
+              continue
+            fi
+            printf '  %-28s %s\n' "$(basename "$app")" "$ver"
+
+            case "$ver" in
+              26.*|2[7-9].*|3[0-9].*) ;;
+              *) continue ;;
+            esac
+
+            num="$(vnum "$ver")"
+            if [ "$num" -gt "$BEST_NUM" ] 2>/dev/null; then
+              BEST="$app"; BEST_VER="$ver"; BEST_NUM="$num"
+            fi
+          done
+
+          echo "--- selected ---"
+          if [ -n "$BEST" ] && [ -d "$BEST/Contents/Developer" ]; then
+            echo "DEVELOPER_DIR=$BEST/Contents/Developer" >> "$GITHUB_ENV"
+            echo "Xcode $BEST_VER  ($BEST)"
+          else
+            echo "::warning::Xcode 26.x が見つかりませんでした。既定のツールチェーンで続行します。"
+            echo "既定: $(xcode-select -p 2>/dev/null || echo unknown)"
+          fi
+          exit 0
+
+      - name: Record toolchain
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          {
+            echo "### Toolchain"
+            echo '```'
+            echo "DEVELOPER_DIR = ${DEVELOPER_DIR:-(unset; xcode-select の既定)}"
+            xcodebuild -version 2>&1 | head -2 || echo "(xcodebuild -version 失敗)"
+            echo
+            xcodebuild -showsdks 2>/dev/null | grep -i iphoneos || echo "(SDK 一覧取得不可)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # Swift コンパイラの前に、独自シンボルの相互参照だけ先に検査する。
+      # macOS ランナーを 10 分使ってから
+      #   error: value of type 'X' has no member 'Y'
+      # で落ちるのを避けるため。
+      # 行単位の編集で波括弧の対応が壊れていないかを先に見る。
+      # rev.36 は Views の 1 行を削除した結果、対応する閉じ括弧が浮いて
+      #   error: extraneous '}' at top level
+      # で落ちた。Swift コンパイラを待たずに検出できる。
+      - name: Check brace balance
+        run: |
+          chmod +x scripts/check-braces.sh
+          ./scripts/check-braces.sh
+
+      - name: Check own symbols
+        run: |
+          chmod +x scripts/check-symbols.sh scripts/check_swift_symbols.py
+          ./scripts/check-symbols.sh
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # -----------------------------------------------------------------------
+      # .xcodeproj / build/ の混入を防ぐため、生成前にスナップショットを取る
+      # -----------------------------------------------------------------------
+      - name: Snapshot sources
+        run: |
+          mkdir -p "$RUNNER_TEMP/snapshot/${{ github.event.repository.name }}"
+          rsync -a --exclude '.git' --exclude 'engine/dist' --exclude '*.xcodeproj' --exclude 'build' \
+            ./ "$RUNNER_TEMP/snapshot/${{ github.event.repository.name }}/"
+
+      - name: Generate Xcode project
+        run: |
+          chmod +x scripts/AddGecko.sh
+          xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Kotone.xcodeproj \
+            -scheme Kotone \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      # -----------------------------------------------------------------------
+      # 未署名 IPA を組み立てる。SideStore 側で署名される前提。
+      # -----------------------------------------------------------------------
+      - name: Package IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/Kotone.app"
+          test -d "$APP" || { echo "::error::app not found"; exit 1; }
+
+          echo "--- bundle sanity checks ---"
+          test -x "$APP/Kotone" || { echo "::error::executable missing"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "::error::Info.plist missing"; exit 1; }
+
+          if [ "$GECKO" = "true" ]; then
+            test -f "$APP/Frameworks/XUL" || { echo "::error::XUL not embedded"; exit 1; }
+            test -d "$APP/Frameworks/GeckoView.framework/Frameworks/modules" \
+              || { echo "::error::Gecko resources not embedded"; exit 1; }
+            # XUL は PlugIns 内を "Reynard Helper.appex" というファイル名で探索する
+            test -d "$APP/PlugIns/Reynard Helper.appex" \
+              || { echo "::error::PlugIns/'Reynard Helper.appex' が見つかりません。project.yml の Helper の PRODUCT_NAME を確認してください"; exit 1; }
+            echo "gecko integration: OK"
+          else
+            echo "gecko integration: skipped (Phase 0-B1)"
+          fi
+
+          # 入れ子の Mach-O が署名を持ったままでないか確認する。
+          # Reynard 配布 IPA 由来の署名が残っていると、実機で
+          #   Library not loaded: @rpath/XUL (code signature invalid, errno=1)
+          # になって起動時にクラッシュする。
+          if [ "$GECKO" = "true" ]; then
+            echo "--- nested Mach-O signature status ---"
+            for f in "$APP/Frameworks/XUL" "$APP"/Frameworks/*.dylib \
+                     "$APP/Frameworks/GeckoView.framework/GeckoView" \
+                     "$APP/PlugIns/Reynard Helper.appex/Reynard Helper" \
+                     "$APP/Kotone"; do
+              [ -f "$f" ] || continue
+              if codesign -dv "$f" > /dev/null 2>&1; then
+                printf '  SIGNED   %s\n' "${f#"$APP/"}"
+              else
+                printf '  unsigned %s\n' "${f#"$APP/"}"
+              fi
+            done
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry "${STAMP}_Kotone-unsigned.ipa" Payload
+          rm -rf Payload
+          ls -lh "${STAMP}_Kotone-unsigned.ipa"
+          du -sh "$APP"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_Kotone-unsigned-ipa
+          path: ${{ env.STAMP }}_Kotone-unsigned.ipa
+          include-hidden-files: true
+          compression-level: 0   # IPA は既に zip
+
+      - name: Upload source snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_source-snapshot
+          path: ${{ runner.temp }}/snapshot
+          include-hidden-files: true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log

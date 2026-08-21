@@ -1,0 +1,463 @@
+# =============================================================================
+# Kotone — XcodeGen project specification (rev.2)
+#
+#   xcodegen generate
+#
+# 名前を変える場合は scripts/rename.sh を使ってください。
+#
+# ---------------------------------------------------------------------------
+# !!! 変更禁止 !!!
+#   Helper ターゲットの PRODUCT_NAME は "Reynard Helper" から変更しないこと。
+#   Gecko(XUL) の GetExtensionIdentifier() が PlugIns/ を走査し、
+#   "Reynard Helper.appex" というファイル名で完全一致検索するため。
+#   参照: reynard-browser patches/ipc/glue/NSExtensionUtils.mm.patch:143
+# ---------------------------------------------------------------------------
+#
+# rev.1 からの変更:
+#   * 全ソースパスに excludes を追加。
+#     rev.1 は Sources/ 配下の PLACE_HERE.md が5つとも
+#     Kotone.app/PLACE_HERE.md へフラット出力され
+#     "Multiple commands produce" でビルドが落ちた。
+#     Reynard のソースにも .md / LICENSE が含まれるため恒久対策が必要。
+#   * GeckoView にヘッダ公開設定を追加（umbrella header 用）
+#   * Sources/App に配管検証用の最小アプリを追加
+#
+# ツールチェーンの検証結果 (probe-toolchain, 72 通り):
+#   Xcode 15.0.1 〜 26.4.1 のすべてで XUL へのリンクが警告ゼロで成功。
+#   -mios-version-min は 15.0 / 18.0 / 26.0 のいずれでも問題なし。
+#   → deploymentTarget 15.0 のまま据え置く。
+#     ビルドは macos-26 + 最新 Xcode 26.x を使う（Reynard 上流に合わせるため。
+#     リンクではなく Swift ソースが SDK 26 世代の API を参照しうるので）。
+# =============================================================================
+
+name: Kotone
+
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    # ViviMusic の Views は iOS 16/17 の SwiftUI API を前提にしている。
+    #   NavigationStack / navigationDestination / LabeledContent /
+    #   AnyShape / presentationDetents / NavigationPath  → iOS 16
+    #   onChange(of:initial:_:) / symbolEffect            → iOS 17
+    # 15.0 のままだと 58 件のエラーになる。
+    #
+    # 対象機は iPadOS 26.6 なので 26.0 で問題ない。
+    # 15.0 以上なので libswift_Concurrency.dylib の同梱も引き続き不要
+    # （fetch-engine.sh で除外済み）。
+    #
+    # probe-toolchain の実測で -mios-version-min 26.0 でも
+    # XUL へのリンクが警告ゼロで通ることは確認済み。
+    iOS: "26.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+# -----------------------------------------------------------------------------
+# 全ターゲット共通のファイル除外。
+# バンドルへフラット出力されて衝突するもの、同梱不要なものを弾く。
+# -----------------------------------------------------------------------------
+fileGroups: []
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+    # AddGecko.sh が SRCROOT 外 (engine/dist) を読むため必須
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # 抽出済み Gecko の置き場所。
+    #   bin/     … scripts/fetch-engine.sh   (XUL, *.dylib, chrome/ など)
+    #   include/ … scripts/fetch-headers.sh  (GeckoView/*.h)
+    # Reynard は $(SRCROOT)/../engine/firefox/obj-*/dist を指していたが、
+    # こちらはビルド済みを抽出したものなので配置だけ合わせてある。
+    GECKO_DIST: "$(SRCROOT)/engine/dist"
+    # Reynard は VALID_ARCHS / ENABLE_BITCODE も設定しているが、
+    # 現行 Xcode ではどちらも deprecated 警告になるため入れない。
+    ARCHS: arm64
+
+    # XUL は 210MB。デッドストリップ対象にしない。
+    DEAD_CODE_STRIPPING: NO
+    # Phase 0-B1 (配管検証) では NO。Reynard ソース配置後に YES にする。
+    # 切り替えは scripts/enable-gecko.sh で行うこと（手動編集は非推奨）。
+    # >>> GECKO-TOGGLE:flag >>>
+    GECKO_INTEGRATION: "YES"
+    # <<< GECKO-TOGGLE:flag <<<
+
+targets:
+
+  # ---------------------------------------------------------------------------
+  # 1. GeckoView.framework — Reynard の Swift/ObjC ラッパ層
+  #
+  #    配布 IPA の GeckoView.framework は .swiftmodule / .swiftinterface を
+  #    含まないため Swift から import できない。必ずソースからビルドする。
+  #    ソース: reynard-browser の browser/GeckoView/
+  # ---------------------------------------------------------------------------
+  GeckoView:
+    type: framework
+    platform: iOS
+    sources:
+      - path: Sources/GeckoView
+        excludes:
+          - "**/*.md"
+          - "**/LICENSE*"
+          - "**/.gitkeep"
+          # XcodeGen が生成するので取り込み分は使わない
+          - "**/Info.plist"
+          # View/GeckoView.h は Reynard 本家でも Headers ビルドフェーズに
+          # 登録されていない死んだファイル。中身の #import "TSUtils.h" は
+          # 存在しないヘッダを指しており、umbrella header 化すると壊れる。
+          # (TSUtils.h の実体は Sources/Shared/Utils.h にリネーム済み)
+          - "View/GeckoView.h"
+      # Reynard は Shared/Utils.m を GeckoView ターゲットにも所属させている。
+      # GeckoRuntime.swift が updateJetsamControl() を呼ぶため必須。
+      #   project.pbxproj:
+      #     Exceptions for "Reynard" folder in "GeckoView" target
+      #       membershipExceptions = ( Shared/Utils.m, )
+      - path: Sources/Shared
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+    # framework にも Info.plist が要る。
+    # 無いと Kotone の Validate 段階で
+    #   error: Framework .../GeckoView.framework did not contain an Info.plist
+    # になる（コンパイルもリンクも通った後に落ちるので原因が分かりにくい）。
+    # Reynard の browser/GeckoView/Info.plist と同じ内容。
+    info:
+      path: Sources/GeckoView/Info.plist
+      properties:
+        CFBundleName: GeckoView
+        CFBundlePackageType: FMWK
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSPrincipalClass: ""
+    settings:
+      base:
+        # ---------------------------------------------------------------
+        # Swift の既定アクター分離を MainActor にする。**必須。**
+        #
+        # GeckoEventDispatcherWrapper はスレッド安全でもアクター分離でも
+        # なく、dispatch() から gecko?.dispatch(toGecko:) で直接 XUL に入る。
+        # Gecko の AutoJSAPI::Init はメインスレッド前提なので、
+        # 協調スレッドプールから呼ばれると null 参照で即死する。
+        #
+        #   Thread com.apple.root.user-initiated-qos.cooperative (crashed)
+        #     0  XUL        mozilla::dom::AutoJSAPI::Init(JSObject*) +52
+        #     1  GeckoView  GeckoEventDispatcherWrapper.query(type:message:)
+        #     5  GeckoView  AddonRuntime.list()
+        #   EXC_BAD_ACCESS (SIGSEGV) at 0x8
+        #
+        # AddonRuntime.list() は nonisolated async なので、既定設定では
+        # @MainActor から await しても協調プールへ逃げる。
+        # 既定分離を MainActor にすると注釈の無いコードが全て MainActor に
+        # 乗り、この経路がメインスレッドに固定される。
+        #
+        # Reynard は project.pbxproj でアプリ本体と GeckoView の
+        # Debug/Release 計 4 箇所に設定している。
+        # Helper と OpenIn には設定していないので、こちらも合わせる。
+        # ---------------------------------------------------------------
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: "YES"
+        PRODUCT_NAME: GeckoView
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.kotone.GeckoView
+        # Reynard は DEFINES_MODULE=YES だが Headers ビルドフェーズは空。
+        # umbrella header を作らせない（作ると GeckoView.h が拾われて壊れる）。
+        DEFINES_MODULE: YES
+        SWIFT_INSTALL_OBJC_HEADER: YES
+        BUILD_LIBRARY_FOR_DISTRIBUTION: NO
+        # ---------------------------------------------------------------
+        # Swift から ObjC 宣言を見せる唯一の経路。
+        #
+        # framework ターゲットでは通常 umbrella header を使うが、
+        # Reynard は Headers ビルドフェーズを空にしたまま、
+        # browser/Configuration/Reynard.xcconfig で全ターゲットに
+        # SWIFT_OBJC_BRIDGING_HEADER を設定している
+        # (project.pbxproj の 6 箇所で確認)。
+        #
+        # これが無いと GeckoView の Swift から
+        # SwiftEventDispatcher / SwiftGeckoViewRuntime / GeckoProcessExtension /
+        # MainProcessInit / GeckoRuntimeBridge / updateJetsamControl が
+        # 一切見えない。Addon.swift のように import Foundation を書かず
+        # ブリッジングヘッダ経由で Foundation を得ているファイルもあるため、
+        # NSObject すら見つからなくなる。
+        # ---------------------------------------------------------------
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging/Kotone-Bridging-Header.h
+        APPLICATION_EXTENSION_API_ONLY: YES   # Helper(appex) から使うため
+        # MainProcessInit / ChildProcessInit は XUL から export されるので
+        # XUL を直接リンクする。-undefined dynamic_lookup は iOS で deprecated。
+        # Reynard の browser/Configuration/Reynard.xcconfig と同じ構成。
+        OTHER_LDFLAGS: "$(inherited) $(GECKO_DIST)/bin/XUL -lmozglue -lnss3 -lfreebl3 -lsoftokn3 -llgpllibs -lmozavcodec -lmozavutil -lgkcodecs -lmozinference"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/bin"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"
+        # Gecko の EXPORTS.GeckoView ヘッダ。scripts/fetch-headers.sh が生成する。
+        #   $(GECKO_DIST)/include/GeckoView/IOSBootstrap.h
+        #   $(GECKO_DIST)/include/GeckoView/GeckoViewSwiftSupport.h
+        #   $(GECKO_DIST)/include/GeckoView/GeckoViewRuntimeSupport.h
+        # サブディレクトリ（Runtime/ など）のヘッダも拾えるよう再帰指定にする
+        HEADER_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/include $(GECKO_DIST)/include/GeckoView $(SRCROOT)/Sources/GeckoView/** $(SRCROOT)/Sources/Helper/** $(SRCROOT)/Sources/Bridging/** $(SRCROOT)/Sources/Shared/**"
+
+  # ---------------------------------------------------------------------------
+  # 2. Reynard Helper.appex — Gecko の子プロセスホスト
+  #    NSExtension を借りてプロセスを確保する。
+  #    ソース: reynard-browser の browser/Helper/
+  # ---------------------------------------------------------------------------
+  Helper:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/Helper
+        excludes:
+          - "**/*.md"
+          - "**/LICENSE*"
+          - "**/.gitkeep"
+          # XcodeGen が info.properties から生成するので取り込み分は使わない
+          - "**/Info.plist"
+          # Reynard 用の entitlements。無料 Personal Team では使えないものを
+          # 含むうえ、リソースとして appex に混入するので除外する。
+          - "Entitlements/**"
+    info:
+      path: Sources/Helper/Info.plist
+      properties:
+        CFBundleName: "Reynard Helper"
+        CFBundleDisplayName: "Reynard Helper"
+        CFBundlePackageType: "XPC!"
+        NSExtension:
+          NSExtensionAttributes:
+            NSExtensionActivationRule: FALSEPREDICATE
+          NSExtensionContextClass: NSExtensionContext
+          NSExtensionContextHostClass: NSExtensionContext
+          NSExtensionPointIdentifier: com.apple.ar.viewer
+          NSExtensionPrincipalClass: ReynardHelperMain
+        XPCService:
+          ServiceType: Application
+          _MultipleInstances: true
+          _ProcessType: App
+    settings:
+      base:
+        # !!! 変更禁止 !!! XUL がこのファイル名で探索する
+        PRODUCT_NAME: "Reynard Helper"
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.kotone.Helper
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../../Frameworks"
+        OTHER_LDFLAGS: "$(inherited) $(GECKO_DIST)/bin/XUL -lmozglue -lnss3 -lfreebl3 -lsoftokn3 -llgpllibs -lmozavcodec -lmozavutil -lgkcodecs -lmozinference"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/bin"
+        HEADER_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/include $(GECKO_DIST)/include/GeckoView $(SRCROOT)/Sources/GeckoView/** $(SRCROOT)/Sources/Helper/** $(SRCROOT)/Sources/Bridging/** $(SRCROOT)/Sources/Shared/**"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging/Kotone-Bridging-Header.h
+    # Helper.swift が `import GeckoView` する。embed は不要
+    # （アプリ本体が Frameworks/ に置いたものを @executable_path/../../Frameworks
+    #  経由で参照する）。
+    dependencies:
+      - target: GeckoView
+        embed: false
+
+  # ---------------------------------------------------------------------------
+  # 3. アプリ本体
+  # ---------------------------------------------------------------------------
+  Kotone:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/App
+        excludes:
+          - "**/*.md"
+          - "**/LICENSE*"
+          - "**/.gitkeep"
+          - "**/Info.plist"
+
+      # Sources/JIT は 0-B2 では含めない。libidevice_ffi.a が必要だが、
+      # これは Rust ビルドの成果物で Reynard のリポジトリにも
+      # 配布 IPA にも含まれていない。docs/PLACEMENT.md 参照。
+      # >>> JIT-TOGGLE:sources >>>
+      #@ - path: Sources/JIT
+      #@   excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      # <<< JIT-TOGGLE:sources <<<
+      - path: Sources/Bridging
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      - path: Sources/Shared
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      - path: Sources/ThirdParty
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      # ViviMusic から取り込んだ UI と InnerTube。
+      # 再生系（Playback / SABR / PoToken / PlayerJSService）は
+      # 取り込んでおらず、PlayerManager は Sources/App に新規実装がある。
+      # ViviMusic の取り込み分は段階的に組み込む。
+      # 現在は Core のみ。Song / BrowseRoute などのモデル定義があり、
+      # 外部シンボルへの依存が無いため単独で通る。
+      #
+      # Views / InnerTube / Services はまだ入れない。
+      # PlayerJSService / PoTokenService / StreamFetcher / StreamProbe
+      # への未解決参照が残っており、入れると必ずビルドが失敗する。
+      # 詳細は docs/VIVIMUSIC.md。
+      - path: Sources/Vivi/Core
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      - path: Sources/Vivi/InnerTube
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      - path: Sources/Vivi/Views
+        excludes: ["**/*.md", "**/LICENSE*", "**/.gitkeep"]
+      - path: Sources/Vivi/Services
+        excludes:
+          - "**/*.md"
+          - "**/LICENSE*"
+          - "**/.gitkeep"
+          # AVAudioEngine / MTAudioProcessingTap による EQ 実装。
+          # ViviMusic では AVPlayer の音声に噛ませていたが、
+          # Kotone は再生が Gecko 内で完結するのでタップする対象が無い。
+          # どこからも参照されていないことを確認済み。
+          #
+          # EqualizerSettings は残すので EqualizerView は表示できる
+          # （設定値が効かないだけ）。
+          - "Equalizer/EqualizerTap.swift"
+          - "Equalizer/BiquadFilter.swift"
+      # Extension/ は素のまま同梱しない。
+      #
+      # 導入経路は組み込みアドオン（resource://android/）で、
+      # scripts/AddGecko.sh が Gecko リソース配下へ配置する。
+      # このビルドは MOZ_REQUIRE_SIGNING=true なので、
+      # 未署名の .xpi を普通にインストールする道は塞がっている。
+      #
+      # scripts/PackExtension.sh が作る kotone-bridge.xpi は
+      # 将来 AMO 署名版を配る場合と、URL 手入力での切り分け用に残してある。
+    info:
+      path: Sources/App/Info.plist
+      properties:
+        CFBundleDisplayName: Kotone
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundlePackageType: APPL
+        LSRequiresIPhoneOS: true
+        UILaunchStoryboardName: ""
+        CADisableMinimumFrameDurationOnPhone: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UIViewControllerBasedStatusBarAppearance: true
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).SceneDelegate
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~iphone:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # audio はバックグラウンド再生と JIT キープアライブの両方で使う
+        UIBackgroundModes:
+          - audio
+          - fetch
+          - processing
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSMicrophoneUsageDescription: "Some sites may request microphone access."
+        NSCameraUsageDescription: "Some sites may request camera access."
+        NSPhotoLibraryAddUsageDescription: "Saves media you download from a site."
+        # .xpi（Firefox アドオン）を「このアプリで開く」で受け取れるようにする。
+        # Reynard の Info.plist と同じ宣言。
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.mozilla.xpi-extension
+            UTTypeDescription: "Firefox Add-on Package"
+            UTTypeConformsTo:
+              - public.zip-archive
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - xpi
+              public.mime-type:
+                - application/x-xpinstall
+                - application/zip
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: "Firefox Add-on Package"
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - org.mozilla.xpi-extension
+    settings:
+      base:
+        # ---------------------------------------------------------------
+        # Swift の既定アクター分離を MainActor にする。**必須。**
+        #
+        # GeckoEventDispatcherWrapper はスレッド安全でもアクター分離でも
+        # なく、dispatch() から gecko?.dispatch(toGecko:) で直接 XUL に入る。
+        # Gecko の AutoJSAPI::Init はメインスレッド前提なので、
+        # 協調スレッドプールから呼ばれると null 参照で即死する。
+        #
+        #   Thread com.apple.root.user-initiated-qos.cooperative (crashed)
+        #     0  XUL        mozilla::dom::AutoJSAPI::Init(JSObject*) +52
+        #     1  GeckoView  GeckoEventDispatcherWrapper.query(type:message:)
+        #     5  GeckoView  AddonRuntime.list()
+        #   EXC_BAD_ACCESS (SIGSEGV) at 0x8
+        #
+        # AddonRuntime.list() は nonisolated async なので、既定設定では
+        # @MainActor から await しても協調プールへ逃げる。
+        # 既定分離を MainActor にすると注釈の無いコードが全て MainActor に
+        # 乗り、この経路がメインスレッドに固定される。
+        #
+        # 詳細は GeckoView ターゲット側のコメントを参照。
+        # ---------------------------------------------------------------
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.kotone
+        TARGETED_DEVICE_FAMILY: "1,2"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/Frameworks/GeckoView.framework"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # main.swift で UIApplicationMain / GeckoRuntime.main を呼ぶため
+        # @main アトリビュートは使わない。
+        #
+        # 0-B2 で有効化する。Reynard-Bridging-Header.h 相当。
+        # >>> GECKO-TOGGLE:bridging >>>
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging/Kotone-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/include $(GECKO_DIST)/include/GeckoView $(SRCROOT)/Sources/GeckoView/** $(SRCROOT)/Sources/Helper/** $(SRCROOT)/Sources/Bridging/** $(SRCROOT)/Sources/Shared/**"
+        OTHER_LDFLAGS: "$(inherited) $(GECKO_DIST)/bin/XUL -lmozglue -lnss3 -lfreebl3 -lsoftokn3 -llgpllibs -lmozavcodec -lmozavutil -lgkcodecs -lmozinference"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/bin"
+        # <<< GECKO-TOGGLE:bridging <<<
+        #
+        # JIT を使う場合のみ。scripts/enable-gecko.sh --with-jit で切り替える。
+        # Sources/JIT/RPPairing/libidevice_ffi.a が必要
+        # (reynard-browser の tools/development/build-idevice.sh が Rust で生成)。
+        # >>> JIT-TOGGLE:settings >>>
+        #@ GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) KOTONE_ENABLE_JIT=1"
+        #@ SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) KOTONE_ENABLE_JIT"
+        #@ LIBRARY_SEARCH_PATHS: "$(inherited) $(GECKO_DIST)/bin $(SRCROOT)/Sources/JIT $(SRCROOT)/Sources/JIT/RPPairing"
+        # <<< JIT-TOGGLE:settings <<<
+    # Phase 0-B1 (配管検証) では GeckoView / Helper を組み込まない。
+    # 切り替えは scripts/enable-gecko.sh で行うこと。
+    # >>> GECKO-TOGGLE:deps >>>
+    dependencies:
+      - target: GeckoView
+        embed: true
+        codeSign: true
+      - target: Helper
+        embed: true
+        codeSign: true
+    postBuildScripts:
+      - name: Pack Kotone bridge extension
+        path: scripts/PackExtension.sh
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - "$(SRCROOT)/Extension/manifest.json"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/kotone-bridge.xpi"
+      - name: Add Gecko engine
+        path: scripts/AddGecko.sh
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - "$(GECKO_DIST)/bin/XUL"
+        outputFiles:
+          - "$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Frameworks/XUL"
+    # <<< GECKO-TOGGLE:deps <<<
+
+schemes:
+  Kotone:
+    build:
+      targets:
+        Kotone: all
+    run:
+      config: Debug
+    archive:
+      config: Release
